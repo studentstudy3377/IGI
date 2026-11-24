@@ -1,0 +1,9 @@
+# The look of your local IGI app: Streamlit's classic colours, no borders on the boxes or the sidebar.
+[theme]
+base = "light"
+primaryColor = "#FF4B4B"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F0F2F6"
+textColor = "#31333F"
+showWidgetBorder = false
+showSidebarBorder = false
