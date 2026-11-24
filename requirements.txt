@@ -1,8 +1,0 @@
-streamlit>=1.36
-pandas
-openpyxl
-requests
-selenium>=4.10
-# Only for running on a Windows PC (visible Chrome); Streamlit Cloud skips these two lines.
-undetected-chromedriver; sys_platform == "win32"
-setuptools; sys_platform == "win32"
