@@ -1,0 +1,1453 @@
+from __future__ import annotations
+
+import html
+import io
+import json
+import numbers
+import os
+import re
+import shutil
+import sys
+import threading
+import time
+import traceback
+import zlib
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from urllib.parse import quote
+
+import pandas as pd
+import requests
+import streamlit as st
+
+# -----------------------------------------------------------------------------
+# Settings
+# -----------------------------------------------------------------------------
+API_URL = os.environ.get(
+    "IGI_API_URL",
+    "https://api.igi.org/ReportDetail.php?Printno={report_no}",
+)
+DIAGNOSIS_URL = os.environ.get(
+    "IGI_DIAGNOSIS_URL",
+    "https://www.igi.org/API-IGI/report-diagnosis.php?r={report_no}",
+)
+ENDPOINT_NAMES = {"api": "IGI API", "page": "report-diagnosis page"}
+# The ways to reach IGI, tried in this order; the one that answers is tried first for the next report.
+ROUTES = {
+    "Auto": [("direct", "api"), ("direct", "page"), ("chrome", "page"), ("chrome", "api")],
+    "Chrome": [("chrome", "page"), ("chrome", "api")],
+    "Direct": [("direct", "api"), ("direct", "page")],
+}
+ON_WINDOWS = sys.platform == "win32"
+# "uc": visible Chrome via undetected-chromedriver (Windows PC).
+# "headless": hidden Chromium via Selenium (a Linux server, if READ_ON_SERVER is True there).
+BROWSER_KIND = os.environ.get("IGI_BROWSER") or ("uc" if ON_WINDOWS else "headless")
+CHROMIUM_CANDIDATES = ["/usr/bin/chromium", "/usr/bin/chromium-browser", "chromium", "chromium-browser",
+                       "google-chrome", "google-chrome-stable"]          # env CHROME_BINARY overrides
+CHROMEDRIVER_CANDIDATES = ["/usr/bin/chromedriver", "/usr/lib/chromium/chromedriver", "chromedriver"]  # env CHROMEDRIVER
+
+SAVE_FILE_NAME = "IGI Data {date}.xlsx"   # name of the downloaded file; {date} = dd-mm-yyyy
+CHROME_PAGE_TIMEOUT = 60                   # seconds per report, including a Cloudflare check
+
+# The app has no settings panel: these are fixed here.
+READ_ON_SERVER = ON_WINDOWS                # True: the app reads IGI itself (your PC). False: your browser reads IGI (Streamlit Cloud, whose servers IGI blocks)
+READ_METHOD = "Auto"                       # when the app reads IGI itself: "Auto", "Chrome" or "Direct" (see ROUTES above)
+SHOW_CHROME = True                         # Windows PC: show the Chrome window (a hidden one is stopped by Cloudflare more often)
+REPORT_NO_AS_IGI = False                   # False: Report No. as you typed it (852601380); True: as IGI prints it (LG852601380)
+DATE_FORMAT = "dd/mm/yyyy"                 # Report Date: one of the names in DATE_FORMATS below
+SKIP_MISSING = False                       # True: leave out the rows that have No Data
+NO_DATA = "No Data"                        # shown instead of any error: a report IGI did not return (not found, blocked …) or anything else that failed
+NO_DATA_COLUMN = "Shape"                   # the column that says No Data on such a report's row (and in the Excel file)
+
+# Your sheet, column for column ("Culet  Size" keeps the two spaces of your header).
+OUTPUT_COLUMNS = [
+    "Lot no", "Document No / Name", "Report Date", "Report No.", "Shape", "Weight",
+    "Clarity", "Col", "P/ct", "$ Rate", "Cost P/Ct", "MM 1", "MM 2", "MM 3", "Table",
+    "Crown Height", "Pavilion Depth", "Total Depth", "Crown Angle", "Pavilion Angle",
+    "Culet  Size", "Girdle Percent", "Girdle Name", "CUT-PROP", "POL or Pol/Sym", "SYM",
+    "Flo", "Ratio",
+]
+NUMBER_COLUMNS = {
+    "Weight", "P/ct", "$ Rate", "Cost P/Ct", "MM 1", "MM 2", "MM 3", "Table",
+    "Crown Height", "Pavilion Depth", "Total Depth", "Crown Angle", "Pavilion Angle",
+    "Girdle Percent", "Ratio",
+}
+
+# IGI "SHAPE AND CUT" -> your shape code; the first word found wins.
+# Only OV comes from your sample row. Change the others to the codes your sheet uses.
+# A shape not listed is written as IGI names it (for example "Old Mine Brilliant").
+SHAPE_CODES = [
+    ("OVAL", "OV"),
+    ("PEAR", "PS"),
+    ("MARQUISE", "MQ"),
+    ("HEART", "HT"),
+    ("PRINCESS", "PR"),
+    ("SQUARE MODIFIED BRILLIANT", "PR"),
+    ("CUSHION", "CU"),
+    ("ASSCHER", "AS"),
+    ("EMERALD", "EM"),
+    ("RADIANT", "RAD"),
+    ("CUT-CORNERED", "RAD"),
+    ("CUT CORNERED", "RAD"),
+    ("BAGUETTE", "BG"),
+    ("TRILLIANT", "TR"),
+    ("TRIANGULAR", "TR"),
+    ("ROUND", "RD"),
+]
+
+# Report Date: shown as text in this format; the Excel file gets a real date.
+DATE_FORMATS: Dict[str, Tuple[Optional[str], Optional[str]]] = {
+    "dd/mm/yyyy": ("%d/%m/%Y", "dd/mm/yyyy"),
+    "dd-mm-yyyy": ("%d-%m-%Y", "dd-mm-yyyy"),
+    "dd-Mmm-yyyy": ("%d-%b-%Y", "dd-mmm-yyyy"),
+    "As IGI writes it": (None, None),
+}
+
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+# -----------------------------------------------------------------------------
+# Small text helpers
+# -----------------------------------------------------------------------------
+_NUM = r"\d+(?:\.\d+)?"
+
+
+def is_blank(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def clean_text(value: Any) -> str:
+    """One line of plain text: no <br>, no HTML entities, single spaces."""
+    if is_blank(value):
+        return ""
+    text = html.unescape(str(value))
+    text = re.sub(r"<br\s*/?>", " ", text, flags=re.I)
+    text = re.sub(r"</?[A-Za-z][^>]*>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def short_error(exc: BaseException) -> str:
+    text = str(exc).strip().splitlines()
+    first = text[0] if text else exc.__class__.__name__
+    return first[:200]
+
+
+def log_problem(text: str, error: bool = False) -> None:
+    """The reason behind a No Data, for the console (Windows PC) or the app's logs (Streamlit Cloud).
+
+    The page itself shows only No Data. error=True adds the traceback of the error being handled.
+    """
+    print(f"[IGI] {text}", file=sys.stderr, flush=True)
+    if error:
+        traceback.print_exc()
+
+
+def _norm(text: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(text).lower())
+
+
+def title_words(text: str) -> str:
+    """'MEDIUM TO SLIGHTLY THICK (FACETED)' -> 'Medium To Slightly Thick (Faceted)'."""
+    text = clean_text(text)
+    return text.title() if text else ""
+
+
+def to_number(text: str) -> Optional[float]:
+    match = re.search(_NUM, text or "")
+    return float(match.group(0)) if match else None
+
+
+def measurements(text: str) -> List[Optional[float]]:
+    """'8.50 x 5.62 x 3.38 mm' -> [8.5, 5.62, 3.38]; '3.91 - 3.94 x 2.42 mm' -> [3.91, 3.94, 2.42]."""
+    values: List[Optional[float]] = [float(n) for n in re.findall(_NUM, text or "")][:3]
+    return values + [None] * (3 - len(values))
+
+
+def percent_and_angle(text: str) -> Tuple[Optional[float], Optional[float]]:
+    """'12.5% - 32.4°' -> (12.5, 32.4); '43.5%' -> (43.5, None)."""
+    text = text or ""
+    nums = [float(n) for n in re.findall(_NUM, text)]
+    pct = re.search(rf"({_NUM})\s*%", text)
+    ang = re.search(rf"({_NUM})\s*(?:°|º|˚|deg)", text, flags=re.I)
+    percent = float(pct.group(1)) if pct else None
+    angle = float(ang.group(1)) if ang else None
+    rest = list(nums)
+    for value in (percent, angle):
+        if value is not None and value in rest:
+            rest.remove(value)
+    if percent is None and rest:
+        percent = rest.pop(0)
+    if angle is None and rest:
+        angle = rest.pop(0)
+    return percent, angle
+
+
+def girdle_name_and_percent(text: str) -> Tuple[str, Optional[float]]:
+    """'MEDIUM TO SLIGHTLY THICK (FACETED)' -> ('Medium To Slightly Thick(Faceted)', None)."""
+    text = clean_text(text)
+    pct = re.search(rf"({_NUM})\s*%", text)
+    percent = float(pct.group(1)) if pct else None
+    name = re.sub(rf"[,;]?\s*\(?\s*{_NUM}\s*%\s*\)?", "", text).strip(" ,;-")
+    name = re.sub(r"\s+\(", "(", title_words(name))
+    return name, percent
+
+
+def shape_code(text: str) -> str:
+    upper = clean_text(text).upper()
+    if not upper:
+        return ""
+    for word, code in SHAPE_CODES:
+        if re.search(rf"(?<![A-Z]){re.escape(word)}(?![A-Z])", upper):
+            return code
+    return title_words(upper)
+
+
+def parse_report_date(text: str) -> Optional[datetime]:
+    text = clean_text(text)
+    for fmt in ("%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%d %b %Y", "%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def format_report_date(text: str, date_fmt: str) -> str:
+    raw = clean_text(text)
+    python_fmt = DATE_FORMATS.get(date_fmt, (None, None))[0]
+    if not raw or python_fmt is None:
+        return raw
+    parsed = parse_report_date(raw)
+    return parsed.strftime(python_fmt) if parsed else raw
+
+
+def ratio(mm1: Optional[float], mm2: Optional[float]) -> Optional[float]:
+    """Length / width: the longer of MM 1 and MM 2 divided by the shorter one."""
+    if not mm1 or not mm2:
+        return None
+    return max(mm1, mm2) / min(mm1, mm2)
+
+
+# -----------------------------------------------------------------------------
+# IGI record -> one row of your sheet
+# -----------------------------------------------------------------------------
+FIELD_KEYS: Dict[str, List[str]] = {
+    "report_no": ["REPORT NUMBER", "Report No", "Report #"],
+    "date": ["REPORT DATE", "Issue Date", "Date of Issue"],
+    "shape": ["SHAPE AND CUT", "Shape and Cutting Style", "Shape & Cut", "Shape"],
+    "weight": ["CARAT WEIGHT", "Weight"],
+    "color": ["COLOR GRADE", "Colour Grade", "Color"],
+    "clarity": ["CLARITY GRADE", "Clarity"],
+    "cut": ["CUT GRADE", "Cut"],
+    "polish": ["POLISH"],
+    "symmetry": ["SYMMETRY"],
+    "measurements": ["Measurements", "Measurement"],
+    "table": ["Table Size", "Table"],
+    "crown": ["Crown Height", "Crown Height - Angle"],
+    "crown_angle": ["Crown Angle"],
+    "pavilion": ["Pavilion Depth", "Pavillion Depth", "Pavilion Depth - Angle"],
+    "pavilion_angle": ["Pavilion Angle", "Pavillion Angle"],
+    "girdle": ["Girdle Thickness", "Girdle"],
+    "girdle_pct": ["Girdle %", "Girdle Percentage", "Girdle Percent"],
+    "culet": ["Culet"],
+    "depth": ["Total Depth", "Depth"],
+    "fluorescence": ["FLUORESCENCE"],
+}
+
+
+def rec_value(record: Dict[str, Any], name: str) -> str:
+    """Value of an IGI field, matching the key without regard to case or spaces."""
+    for alias in FIELD_KEYS[name]:
+        value = record.get(_norm(alias))
+        if not is_blank(value):
+            return clean_text(value)
+    return ""
+
+
+def build_row(query: str, record: Dict[str, Any], igi_number: bool, date_fmt: str) -> Dict[str, Any]:
+    rec = {_norm(k): v for k, v in (record or {}).items() if _norm(k)}
+    row: Dict[str, Any] = {column: None for column in OUTPUT_COLUMNS}
+    row["Report No."] = (rec_value(rec, "report_no") if igi_number else "") or query
+    if not rec:
+        return row
+
+    mm1, mm2, mm3 = measurements(rec_value(rec, "measurements"))
+    crown_height, crown_angle = percent_and_angle(rec_value(rec, "crown"))
+    pavilion_depth, pavilion_angle = percent_and_angle(rec_value(rec, "pavilion"))
+    girdle_name, girdle_pct = girdle_name_and_percent(rec_value(rec, "girdle"))
+
+    row.update({
+        "Report Date": format_report_date(rec_value(rec, "date"), date_fmt) or None,
+        "Shape": shape_code(rec_value(rec, "shape")) or None,
+        "Weight": to_number(rec_value(rec, "weight")),
+        "Clarity": re.sub(r"\s+", "", rec_value(rec, "clarity")).upper() or None,
+        "Col": rec_value(rec, "color") or None,
+        "MM 1": mm1,
+        "MM 2": mm2,
+        "MM 3": mm3,
+        "Table": to_number(rec_value(rec, "table")),
+        "Crown Height": crown_height,
+        "Pavilion Depth": pavilion_depth,
+        "Total Depth": to_number(rec_value(rec, "depth")),
+        "Crown Angle": crown_angle if crown_angle is not None else to_number(rec_value(rec, "crown_angle")),
+        "Pavilion Angle": pavilion_angle if pavilion_angle is not None else to_number(rec_value(rec, "pavilion_angle")),
+        "Culet  Size": title_words(rec_value(rec, "culet")) or None,
+        "Girdle Percent": girdle_pct if girdle_pct is not None else to_number(rec_value(rec, "girdle_pct")),
+        "Girdle Name": girdle_name or None,
+        "CUT-PROP": title_words(rec_value(rec, "cut")) or None,
+        "POL or Pol/Sym": title_words(rec_value(rec, "polish")) or None,
+        "SYM": title_words(rec_value(rec, "symmetry")) or None,
+        "Flo": title_words(rec_value(rec, "fluorescence")) or None,
+        "Ratio": ratio(mm1, mm2),
+    })
+    return row
+
+
+# -----------------------------------------------------------------------------
+# Reading IGI's answer (API JSON or the report-diagnosis page)
+# -----------------------------------------------------------------------------
+@dataclass
+class FetchResult:
+    query: str
+    status: str                       # "OK", "Not found" or "Error"
+    record: Dict[str, Any] = field(default_factory=dict)
+    message: str = ""
+    source: str = ""                  # "direct", "chrome" or "browser"
+    endpoint: str = ""                # "api" or "page"
+
+
+def has_data(result: Optional[Dict[str, Any]]) -> bool:
+    """True when IGI returned the report; anything else (not found, blocked, any error) is No Data."""
+    return bool(result) and result.get("status") == "OK" and bool(result.get("record"))
+
+
+def _json_body(text: str) -> str:
+    """The text without Chrome's JSON-viewer 'Pretty-print' label in front."""
+    return re.sub(r"^\s*Pretty-print\s*", "", text or "")
+
+
+def page_kind(text: str) -> str:
+    text = text or ""
+    if "IGI Report Diagnosis" in text:
+        return "diagnosis"
+    body = _json_body(text).strip()
+    if body[:1] in ("[", "{") or re.fullmatch(r'null|false|true|"[^"<>]{0,200}"', body):
+        return "json"                     # the API's answer (null/false/"..." for an unknown number)
+    low = text.lower()
+    if "you have been blocked" in low or "attention required" in low:
+        return "blocked"
+    if any(s in low for s in ("just a moment", "verify you are human", "checking your browser",
+                              "performing security verification")):
+        return "challenge"
+    if "err_" in low or "this site can" in low:
+        return "browser_error"
+    if not body:
+        return "empty"
+    return "unknown"
+
+
+def is_report_record(record: Any) -> bool:
+    if not isinstance(record, dict):
+        return False
+    keys = {_norm(k) for k in record}
+    return bool(keys & {"reportnumber", "caratweight", "shapeandcut"})
+
+
+def read_api_json(text: str) -> List[Dict[str, Any]]:
+    """Report records from the API's JSON ([{...}], one {...}, or nothing for an unknown number)."""
+    body = _json_body(text).strip()
+    try:
+        value, _ = json.JSONDecoder(strict=False).raw_decode(body)
+    except ValueError:
+        return []
+    if isinstance(value, dict):
+        value = [value]
+    return [r for r in value if is_report_record(r)] if isinstance(value, list) else []
+
+
+def _json_list_after(text: str, heading: str, stop: str = "") -> Optional[List[Any]]:
+    """The JSON array that follows 'data:' under a heading of the diagnosis page."""
+    start = text.find(heading)
+    if start < 0:
+        return None
+    data_at = text.find("data:", start)
+    end = text.find(stop, start + len(heading)) if stop else -1
+    if data_at < 0 or (end >= 0 and data_at > end):
+        return None
+    bracket = text.find("[", data_at)
+    if bracket < 0 or re.sub(r"<br\s*/?>|\s", "", text[data_at + 5:bracket], flags=re.I):
+        return None
+    try:
+        value, _ = json.JSONDecoder(strict=False).raw_decode(text, bracket)
+    except ValueError:
+        return None
+    return value if isinstance(value, list) else None
+
+
+def read_diagnosis_page(text: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """(loose report records, jewellery/SWIFT records) from the page HTML or its visible text."""
+    loose = _json_list_after(text, "LOOSE REPORT DATA", stop="SWIFT/JEWELRY DATA") or []
+    swift = _json_list_after(text, "SWIFT/JEWELRY DATA") or []
+    return [r for r in loose if isinstance(r, dict)], [r for r in swift if isinstance(r, dict)]
+
+
+def merge_records(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {}
+    for record in records:
+        for key, value in record.items():
+            if key not in merged or is_blank(merged[key]):
+                merged[key] = value
+    return merged
+
+
+def interpret_page(query: str, text: str, source: str, endpoint: str = "page") -> FetchResult:
+    kind = page_kind(text)
+
+    def result(status: str, record: Optional[Dict[str, Any]] = None, message: str = "") -> FetchResult:
+        return FetchResult(query, status, record or {}, message, source, endpoint)
+
+    if kind == "blocked":
+        return result("Error", message="blocked by IGI's Cloudflare")
+    if kind == "challenge":
+        return result("Error", message="stopped at IGI's Cloudflare check (Verify you are human)")
+    if kind == "json":
+        records = read_api_json(text)
+        if records:
+            return result("OK", merge_records(records))
+        return result("Not found", message="IGI has no report with this number.")
+    if kind == "empty":
+        return result("Error", message="empty answer from IGI")
+    if kind != "diagnosis":
+        return result("Error", message="the IGI page did not open")
+    loose, swift = read_diagnosis_page(text)
+    if loose:
+        return result("OK", merge_records(loose))
+    if swift:
+        return result("OK", merge_records(swift), "Taken from IGI's jewellery (SWIFT) data.")
+    return result("Not found", message="IGI has no report with this number.")
+
+
+def find_program(env_name: str, candidates: List[str]) -> Optional[str]:
+    """A program path: the environment variable if set, else the first candidate that exists."""
+    path = os.environ.get(env_name, "").strip()
+    if path:
+        return path
+    for candidate in candidates:
+        found = candidate if os.path.isabs(candidate) and os.path.exists(candidate) else shutil.which(candidate)
+        if found:
+            return found
+    return None
+
+
+class ChromePage:
+    """One browser, reused for a whole batch (only when the app reads IGI itself).
+
+    kind "uc": visible Chrome via undetected-chromedriver (Windows PC, as in the IGI report script).
+    kind "headless": hidden Chromium via Selenium (a Linux server with READ_ON_SERVER set to True;
+    it needs the chromium and chromium-driver packages, which Streamlit Cloud does not).
+    """
+
+    def __init__(self, show_window: bool = True, kind: str = BROWSER_KIND):
+        self.kind = kind
+        self.show_window = show_window and kind == "uc"
+        self.driver = None
+        self.extra_args: List[str] = []           # additional Chrome switches, if ever needed
+        self.extra_kwargs: Dict[str, Any] = {}    # e.g. driver_executable_path=... (uc only)
+
+    def start(self) -> None:
+        if self.kind == "uc":
+            self._start_uc()
+        else:
+            self._start_headless()
+        self.driver.set_page_load_timeout(CHROME_PAGE_TIMEOUT)
+
+    def _start_headless(self) -> None:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.service import Service
+
+        options = webdriver.ChromeOptions()
+        browser = find_program("CHROME_BINARY", CHROMIUM_CANDIDATES)
+        if browser:
+            options.binary_location = browser
+        for arg in ("--headless=new", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                    "--window-size=1100,850", *self.extra_args):
+            options.add_argument(arg)
+        driver_path = find_program("CHROMEDRIVER", CHROMEDRIVER_CANDIDATES)
+        service = Service(executable_path=driver_path) if driver_path else Service()
+        self.driver = webdriver.Chrome(service=service, options=options)
+
+    def _options(self):
+        import undetected_chromedriver as uc
+
+        options = uc.ChromeOptions()
+        if not self.show_window:
+            options.add_argument("--headless=new")
+        options.add_argument("--window-size=1100,850")
+        options.add_argument("--disable-features=IsolateOrigins,site-per-process")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        for arg in self.extra_args:
+            options.add_argument(arg)
+        return options
+
+    def _start_uc(self) -> None:
+        import undetected_chromedriver as uc
+        from selenium.common.exceptions import SessionNotCreatedException
+
+        if not getattr(uc.Chrome, "_quiet_del", False):
+            original_del = uc.Chrome.__del__
+
+            def quiet_del(chrome):          # Windows: ignore "handle is invalid" on exit
+                try:
+                    original_del(chrome)
+                except Exception:
+                    pass
+
+            uc.Chrome.__del__ = quiet_del
+            uc.Chrome._quiet_del = True
+
+        try:
+            self.driver = uc.Chrome(options=self._options(), **self.extra_kwargs)
+        except SessionNotCreatedException as exc:
+            # ChromeDriver and Chrome versions differ: retry with Chrome's own major version.
+            match = re.search(r"Current browser version is (\d+)\.", str(exc))
+            if not match:
+                raise
+            self.driver = uc.Chrome(
+                options=self._options(), version_main=int(match.group(1)), **self.extra_kwargs
+            )
+
+    def read(self, url: str, timeout: float = CHROME_PAGE_TIMEOUT,
+             on_check: Optional[Callable[[], None]] = None) -> str:
+        """Open the URL and return its visible text once IGI's answer (or a block page) is there."""
+        if self.driver is None:
+            self.start()
+        self.driver.get(url)
+        deadline = time.monotonic() + timeout
+        told = False
+        text = ""
+        while True:
+            try:
+                state, text = self.driver.execute_script(
+                    "return [document.readyState, document.body ? document.body.innerText : ''];"
+                )
+                text = text or ""
+            except Exception:              # the page is changing (Cloudflare redirect)
+                state, text = "loading", text
+            kind = page_kind(text)
+            if (kind in ("diagnosis", "json", "empty") and state == "complete") or kind in ("blocked", "browser_error"):
+                return text
+            if kind == "challenge" and not told and on_check is not None:
+                on_check()
+                told = True
+            if time.monotonic() >= deadline:
+                return text
+            time.sleep(0.5)
+
+    def close(self) -> None:
+        if self.driver is not None:
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+            self.driver = None
+
+
+def route_label(how: str, endpoint: str) -> str:
+    way = {"direct": "direct request", "browser": "your browser"}.get(how, "Chrome")
+    return f"{ENDPOINT_NAMES.get(endpoint, endpoint)} ({way})"
+
+
+class IGIFetcher:
+    """Reads report numbers one by one (only when the app reads IGI itself).
+
+    It tries the ways to reach IGI in ROUTES order (Auto: API by direct request, the
+    report-diagnosis page by direct request, the page in Chrome, the API in Chrome). A way that
+    IGI's Cloudflare refuses is dropped for the rest of the batch; the way that answered is tried
+    first for the next report.
+    """
+
+    def __init__(self, method: str = "Auto", show_chrome: bool = True,
+                 on_status: Optional[Callable[[str], None]] = None):
+        self.method = method
+        self.on_status = on_status or (lambda message: None)
+        self.routes: List[Tuple[str, str]] = list(ROUTES.get(method, ROUTES["Auto"]))
+        self.dropped: Dict[Tuple[str, str], str] = {}      # way -> why it is not used any more
+        uses_chrome = any(how == "chrome" for how, _ in self.routes)
+        self.chrome = ChromePage(show_chrome) if uses_chrome else None
+        self.session = requests.Session()
+
+    def _direct(self, url: str) -> Tuple[Optional[str], str]:
+        try:
+            response = self.session.get(url, headers=BROWSER_HEADERS, timeout=20)
+        except requests.RequestException as exc:
+            return None, f"the request failed ({short_error(exc)})"
+        return response.content.decode("utf-8", errors="replace"), ""
+
+    def _in_chrome(self, url: str, endpoint: str) -> Tuple[Optional[str], str]:
+        if self.chrome.driver is None:
+            self.on_status("Starting Chrome…")
+            try:
+                self.chrome.start()
+            except Exception as exc:
+                message = f"Could not start Chrome: {short_error(exc)}"
+                for route in self.routes:
+                    if route[0] == "chrome":
+                        self.dropped[route] = message
+                return None, message
+        visible = self.chrome.show_window
+        note = ("IGI is showing a Cloudflare check in the Chrome window. If it asks, tick the box there."
+                if visible else "IGI is showing a Cloudflare check; waiting for it to pass…")
+        # Nobody can tick a check in a hidden browser, so the API (which asks for one) gets less time.
+        timeout = CHROME_PAGE_TIMEOUT if (visible or endpoint == "page") else 20
+        try:
+            return self.chrome.read(url, timeout=timeout, on_check=lambda: self.on_status(note)), ""
+        except Exception as exc:
+            self.chrome.close()                # a fresh window for the next report
+            return None, f"Chrome: {short_error(exc)}"
+
+    def fetch(self, query: str) -> FetchResult:
+        last: Optional[FetchResult] = None
+        for route in list(self.routes):
+            if route in self.dropped:
+                continue
+            how, endpoint = route
+            url = (API_URL if endpoint == "api" else DIAGNOSIS_URL).format(report_no=quote(query, safe=""))
+            text, problem = self._direct(url) if how == "direct" else self._in_chrome(url, endpoint)
+            if text is None:
+                if how == "direct":
+                    self.dropped[route] = problem
+                last = FetchResult(query, "Error", message=problem, source=how, endpoint=endpoint)
+                continue
+            result = interpret_page(query, text, how, endpoint)
+            if result.status in ("OK", "Not found"):
+                self.routes.remove(route)
+                self.routes.insert(0, route)   # the way that answered goes first next time
+                return result
+            if page_kind(text) in ("blocked", "challenge"):
+                self.dropped[route] = result.message
+            last = result
+        reasons = {route_label(*r): m for r, m in self.dropped.items()}
+        if last is not None and last.status == "Error":
+            reasons.setdefault(route_label(last.source, last.endpoint), last.message)
+        message = "IGI did not answer: " + "; ".join(f"{k}: {v}" for k, v in reasons.items()) + "."
+        if self.method == "Direct":
+            message += " Set READ_METHOD to Auto or Chrome at the top of the file."
+        return FetchResult(query, "Error", message=message, source=last.source if last else "",
+                           endpoint=last.endpoint if last else "")
+
+    def close(self) -> None:
+        if self.chrome is not None:
+            self.chrome.close()
+
+
+# -----------------------------------------------------------------------------
+# Reading IGI in the user's own browser (the "IGI → sheet" bookmark)
+#
+# IGI refuses Streamlit Cloud's servers, but it serves the user's own browser. On Streamlit Cloud the
+# Fetch button opens www.igi.org with the report numbers after the # (…#reports=n1,n2,…). On that tab
+# the bookmark reads /API-IGI/report-diagnosis.php for each number from the same site (so no
+# cross-site rules apply), sends the records back to the app tab that opened it and closes the tab.
+# If the browser has cut the link between the two tabs, it copies the records instead, to paste into
+# the app (sidebar: "Result not back? Paste it here").
+# -----------------------------------------------------------------------------
+BOOKMARKLET_JS = r"""
+void (async function () {
+  var ID = "igi-sheet-box";
+  var old = document.getElementById(ID);
+  if (old) { old.remove(); }
+  var box = document.createElement("div");
+  box.id = ID;
+  box.style.cssText = "position:fixed;top:16px;right:16px;z-index:2147483647;width:400px;max-width:90vw;background:#fff;color:#111;border:2px solid #b4232c;border-radius:10px;padding:14px;font:14px/1.45 system-ui,Segoe UI,Arial,sans-serif;box-shadow:0 8px 30px rgba(0,0,0,.25);text-align:left";
+  var title = document.createElement("div");
+  title.textContent = "IGI → sheet";
+  title.style.cssText = "font-weight:700;margin-bottom:6px;color:#b4232c";
+  var msg = document.createElement("div");
+  box.appendChild(title);
+  box.appendChild(msg);
+  document.body.appendChild(box);
+  function say(text) { msg.textContent = text; }
+  function button(label, onClick) {
+    var b = document.createElement("button");
+    b.textContent = label;
+    b.style.cssText = "margin:8px 8px 0 0;padding:7px 14px;border:0;border-radius:6px;background:#b4232c;color:#fff;font:600 13px system-ui,Segoe UI,Arial,sans-serif;cursor:pointer";
+    b.onclick = onClick;
+    box.appendChild(b);
+    return b;
+  }
+  function closeButton() { button("Close", function () { box.remove(); }); }
+  var app = null;
+  try { if (window.opener && !window.opener.closed) { app = window.opener; } } catch (e) { app = null; }
+  function askApp(request, answerType, ms, origin) {
+    return new Promise(function (resolve) {
+      if (!app) { resolve(null); return; }
+      var settled = false;
+      function finish(value) {
+        if (settled) { return; }
+        settled = true;
+        window.removeEventListener("message", onMessage);
+        resolve(value);
+      }
+      function onMessage(e) {
+        if (e.source === app && e.data && e.data.type === answerType) { finish({ data: e.data, origin: e.origin }); }
+      }
+      window.addEventListener("message", onMessage);
+      try { app.postMessage(request, origin || "*"); } catch (err) { finish(null); return; }
+      setTimeout(function () { finish(null); }, ms);
+    });
+  }
+  say("Starting…");
+  var hello = await askApp({ type: "igi-sheet-hello" }, "igi-sheet-here", 1500);
+  var m = location.hash.match(/reports=([^&]*)/);
+  var raw = m ? decodeURIComponent(m[1]) : "";
+  if (!raw && hello && Array.isArray(hello.data.numbers)) { raw = hello.data.numbers.join(","); }
+  if (!raw) { raw = prompt("IGI report numbers (any separator):", "") || ""; }
+  var nums = (raw.match(/(?:LG)?\d{6,}/gi) || []).map(function (s) { return s.toUpperCase(); });
+  nums = nums.filter(function (n, i) { return nums.indexOf(n) === i; });
+  if (!nums.length) { say("No report numbers given."); closeButton(); return; }
+  function section(html, head, stop) {
+    var a = html.indexOf(head);
+    if (a < 0) { return []; }
+    var end = stop ? html.indexOf(stop, a + head.length) : -1;
+    var d = html.indexOf("data:", a);
+    if (d < 0 || (end >= 0 && d > end)) { return []; }
+    var s = html.indexOf("[", d);
+    if (s < 0) { return []; }
+    var depth = 0, inString = false, escaped = false;
+    for (var i = s; i < html.length; i++) {
+      var c = html.charAt(i);
+      if (inString) {
+        if (escaped) { escaped = false; } else if (c === "\\") { escaped = true; } else if (c === '"') { inString = false; }
+      } else if (c === '"') { inString = true; }
+      else if (c === "[") { depth++; }
+      else if (c === "]") {
+        depth--;
+        if (depth === 0) {
+          try {
+            var value = JSON.parse(html.slice(s, i + 1).replace(/[\r\n]/g, " "));
+            return Array.isArray(value) ? value.filter(function (r) { return r && typeof r === "object"; }) : [];
+          } catch (e) { return []; }
+        }
+      }
+    }
+    return [];
+  }
+  async function readOne(n) {
+    try {
+      var r = await fetch("/API-IGI/report-diagnosis.php?r=" + encodeURIComponent(n), { credentials: "same-origin", cache: "no-store" });
+      var html = await r.text();
+      if (html.indexOf("IGI Report Diagnosis") < 0) {
+        return { query: n, status: "Error", message: "IGI did not return its report page (HTTP " + r.status + ")", notIgi: true };
+      }
+      var records = section(html, "LOOSE REPORT DATA", "SWIFT/JEWELRY DATA");
+      if (!records.length) { records = section(html, "SWIFT/JEWELRY DATA", ""); }
+      return records.length ? { query: n, status: "OK", records: records } : { query: n, status: "Not found" };
+    } catch (e) {
+      return { query: n, status: "Error", message: String(e) };
+    }
+  }
+  var out = new Array(nums.length);
+  say("Reading " + nums[0] + " (1 of " + nums.length + ")…");
+  out[0] = await readOne(nums[0]);
+  if (out[0].notIgi) {
+    say("IGI did not return its report page here. Open IGI with the Fetch button in the app, let the page load, then click this bookmark on that tab.");
+    closeButton();
+    return;
+  }
+  var next = 1, count = 1;
+  async function worker() {
+    while (next < nums.length) {
+      var i = next;
+      next++;
+      out[i] = await readOne(nums[i]);
+      count++;
+      say("Read " + count + " of " + nums.length + "…");
+    }
+  }
+  await Promise.all([worker(), worker(), worker()]);
+  var ok = 0, missing = 0, failed = 0;
+  out.forEach(function (item) {
+    delete item.notIgi;
+    if (item.status === "OK") { ok++; } else if (item.status === "Not found") { missing++; } else { failed++; }
+  });
+  var text = JSON.stringify({ igi_reports: out, read_at: new Date().toISOString() });
+  var summary = "Done: " + ok + " read" + (missing ? ", " + missing + " not found" : "") + (failed ? ", " + failed + " failed" : "") + ".";
+  var area = document.createElement("textarea");
+  area.value = text;
+  area.readOnly = true;
+  area.style.cssText = "display:block;width:100%;height:80px;margin-top:8px;font:11px/1.3 monospace;box-sizing:border-box";
+  box.appendChild(area);
+  var copy = button("Copy result", async function () {
+    try { await navigator.clipboard.writeText(text); }
+    catch (e) { area.focus(); area.select(); document.execCommand("copy"); }
+    copy.textContent = "Copied ✓";
+  });
+  closeButton();
+  if (hello) {
+    say(summary + " Sending it to the app…");
+    var sent = await askApp({ type: "igi-sheet-result", text: text }, "igi-sheet-received", 3000, hello.origin);
+    if (sent) {
+      say(summary + " The app has it. This tab closes by itself…");
+      setTimeout(function () {
+        window.close();
+        setTimeout(function () { say(summary + " The app has it: you can close this tab."); }, 500);
+      }, 1200);
+      return;
+    }
+  }
+  var copied = false;
+  try { await navigator.clipboard.writeText(text); copied = true; } catch (e) { copied = false; }
+  if (copied) { copy.textContent = "Copied ✓"; }
+  var where = " in the app, under 'Result not back? Paste it here' in the sidebar.";
+  say(summary + (copied ? " It is copied: paste it" + where : " Click Copy result, then paste it" + where));
+})();
+"""
+
+BOOKMARK_BUTTON_HTML = """
+<div style="font-family:system-ui,'Segoe UI',Arial,sans-serif;display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;padding:6px 2px">
+  <a href="__URL__" title="IGI → sheet"
+     onclick="document.getElementById('hint').textContent='Drag it (don\\'t click it) onto your bookmarks bar.';return false;"
+     style="background:#b4232c;color:#fff;padding:9px 18px;border-radius:8px;text-decoration:none;font-weight:600;font-size:15px">IGI → sheet</a>
+  <span id="hint" style="color:#444;font-size:14px">← drag this button onto your bookmarks bar</span>
+</div>
+"""
+
+# The Fetch button on Streamlit Cloud: a Streamlit components-v2 element, so it runs in the app's page,
+# styled like Streamlit's own red button. It opens the IGI tab, gives the bookmark the report numbers
+# if the # got lost on the way (Cloudflare check), and hands the result the bookmark sends back to Python.
+BRIDGE_HTML = '<button type="button" disabled>Fetch from IGI</button>'
+
+BRIDGE_CSS = """
+button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  min-height: 2.5rem;
+  margin: 0;
+  padding: 0.25rem 0.75rem;
+  font-family: var(--st-font, inherit);
+  font-size: 1rem;
+  font-weight: var(--st-base-font-weight, 400);
+  line-height: 1.6;
+  color: #fff;
+  background-color: var(--st-primary-color);
+  border: 1px solid var(--st-primary-color);
+  border-radius: var(--st-button-radius, 0.5rem);
+  cursor: pointer;
+  user-select: none;
+}
+button:hover:not(:disabled),
+button:active:not(:disabled) {
+  background-color: color-mix(in srgb, var(--st-primary-color) 70%, black);
+  border-color: color-mix(in srgb, var(--st-primary-color) 70%, black);
+}
+button:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 0.2rem color-mix(in srgb, var(--st-primary-color) 50%, transparent);
+}
+button:disabled {
+  color: color-mix(in srgb, var(--st-text-color) 40%, transparent);
+  background-color: transparent;
+  border-color: var(--st-border-color);
+  cursor: not-allowed;
+}
+"""
+
+BRIDGE_JS = r"""
+export default function (component) {
+  const { data, parentElement, setTriggerValue } = component;
+  const url = (data && data.url) || "";
+  const numbers = data && Array.isArray(data.numbers) ? data.numbers : [];
+
+  const button = parentElement.querySelector("button");
+  button.textContent = (data && data.label) || "Fetch from IGI";
+  button.disabled = !url;
+  button.onclick = () => {
+    if (url) {
+      window.open(url, "_blank");   // no "noopener": the IGI tab sends the result back to this page
+      setTriggerValue("opened", Date.now());
+    }
+  };
+
+  // Messages from the bookmark on the IGI tab.
+  const onMessage = (event) => {
+    if (!/^https:\/\/([a-z0-9-]+\.)*igi\.org$/i.test(event.origin)) {
+      return;
+    }
+    const message = event.data || {};
+    const answer = (reply) => {
+      try {
+        event.source.postMessage(reply, event.origin);
+      } catch (e) {
+        // the IGI tab was closed
+      }
+    };
+    if (message.type === "igi-sheet-hello") {
+      answer({ type: "igi-sheet-here", numbers: numbers });
+    } else if (message.type === "igi-sheet-result" && typeof message.text === "string") {
+      setTriggerValue("reports", message.text);
+      answer({ type: "igi-sheet-received" });
+    }
+  };
+  const holder = window.__igiSheet || (window.__igiSheet = {});
+  if (holder.onMessage) {
+    window.removeEventListener("message", holder.onMessage);
+  }
+  holder.onMessage = onMessage;
+  window.addEventListener("message", onMessage);
+  return () => {
+    window.removeEventListener("message", onMessage);
+    if (holder.onMessage === onMessage) {
+      holder.onMessage = null;
+    }
+  };
+}
+"""
+
+
+def bookmarklet_url() -> str:
+    """The bookmark's address: javascript: plus the code above on one line, percent-encoded."""
+    code = " ".join(line.strip() for line in BOOKMARKLET_JS.strip().splitlines() if line.strip())
+    return "javascript:" + quote(code, safe="")
+
+
+def browser_link(queries: List[str]) -> str:
+    """The IGI page to open, carrying the report numbers for the bookmark after the #."""
+    first = DIAGNOSIS_URL.format(report_no=quote(queries[0], safe=""))
+    return first.split("#")[0] + "#reports=" + ",".join(quote(q, safe="") for q in queries)
+
+
+BAD_PASTE = "That isn't the bookmark's result. On the IGI tab click Copy result, then paste here again."
+
+
+def parse_browser_result(text: str) -> Tuple[Dict[str, Dict[str, Any]], str]:
+    """Results keyed by report number from the bookmark's JSON, and a problem message if any."""
+    text = (text or "").strip()
+    start = text.find("{")
+    if start < 0:
+        return {}, BAD_PASTE
+    try:
+        data, _ = json.JSONDecoder(strict=False).raw_decode(text[start:])
+    except ValueError:
+        return {}, BAD_PASTE
+    items = data.get("igi_reports") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return {}, BAD_PASTE
+    results: Dict[str, Dict[str, Any]] = {}
+    for item in items:
+        if not isinstance(item, dict) or not str(item.get("query") or "").strip():
+            continue
+        query = clean_report_cell(item["query"]) or str(item["query"]).strip().upper()
+        records = [r for r in (item.get("records") or []) if is_report_record(r)]
+        if item.get("status") == "OK" and records:
+            result = FetchResult(query, "OK", merge_records(records), "", "browser", "page")
+        elif item.get("status") == "Not found":
+            result = FetchResult(query, "Not found", {}, "IGI has no report with this number.", "browser", "page")
+        else:
+            result = FetchResult(query, "Error", {}, str(item.get("message") or "not read"), "browser", "page")
+        results[query] = asdict(result)
+    return results, ("" if results else BAD_PASTE)
+
+
+# -----------------------------------------------------------------------------
+# Input: pasted report numbers, or rows copied from Excel with their header row
+# -----------------------------------------------------------------------------
+REPORT_HEADERS = [  # normalised header names that hold the report number, in order of preference
+    "reportno", "reportnumber", "igireportno", "igireportnumber", "inputreportnumber",
+    "reportnos", "report", "reportid", "certificateno", "certificatenumber", "certno",
+    "certnumber", "certificate", "cert", "igino", "igi", "id",
+]
+OUTPUT_BY_KEY = {_norm(column): column for column in OUTPUT_COLUMNS}
+_TOKEN = re.compile(r"(?<![A-Za-z0-9])(LG)?\s?(\d{6,})(?![0-9])", re.I)
+
+
+def report_tokens(text: str) -> List[str]:
+    """Report numbers in free text: 6+ digits, keeping an LG prefix (lab-grown)."""
+    return [(prefix or "").upper() + digits for prefix, digits in _TOKEN.findall(text or "")]
+
+
+def clean_report_cell(value: Any) -> str:
+    text = re.sub(r"[\s#\"']", "", clean_text(value)).upper()
+    text = re.sub(r"\.0+$", "", text)
+    if text.startswith("IGI") and text[3:4].isalnum():
+        text = text[3:]
+    return text if re.fullmatch(r"[A-Z]{0,3}\d{6,}", text) else ""
+
+
+def excel_shortened(text: str) -> List[str]:
+    return re.findall(r"(?<![\w.])\d(?:\.\d+)?[eE]\+\d{1,2}\b", text or "")
+
+
+def find_report_column(header: List[str]) -> Optional[int]:
+    keys = [_norm(cell) for cell in header]
+    for wanted in REPORT_HEADERS:
+        if wanted in keys:
+            return keys.index(wanted)
+    return None
+
+
+def rows_to_entries(header: List[str], rows: List[List[str]], report_idx: int,
+                    notes: List[str]) -> List[Dict[str, Any]]:
+    column_of = {
+        i: OUTPUT_BY_KEY[_norm(cell)]
+        for i, cell in enumerate(header)
+        if i != report_idx and _norm(cell) in OUTPUT_BY_KEY and OUTPUT_BY_KEY[_norm(cell)] != "Report No."
+    }
+    entries: List[Dict[str, Any]] = []
+    skipped: List[str] = []
+    for cells in rows:
+        raw = cells[report_idx] if report_idx < len(cells) else ""
+        query = clean_report_cell(raw)
+        if not query:
+            if any(str(c).strip() for c in cells):
+                skipped.append(str(raw).strip() or "(blank)")
+            continue
+        extras = {
+            column: str(cells[i]).strip()
+            for i, column in column_of.items()
+            if i < len(cells) and str(cells[i]).strip()
+        }
+        entries.append({"query": query, "extras": extras})
+    if skipped:
+        shown = ", ".join(skipped[:10]) + (" …" if len(skipped) > 10 else "")
+        notes.append(f"Skipped {len(skipped)} row(s) with no report number in the report column: {shown}")
+    return entries
+
+
+def _shortened_note(text: str) -> List[str]:
+    found = excel_shortened(text)
+    if not found:
+        return []
+    return [
+        "These look like numbers Excel shortened, and the real report number is lost: "
+        + ", ".join(dict.fromkeys(found))
+        + ". Format the column as Number with 0 decimals in Excel and copy again."
+    ]
+
+
+def parse_pasted(text: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+    lines = (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    rows = [line.split("\t") for line in lines if line.strip()]
+    if not rows:
+        return [], []
+    notes = _shortened_note(text)
+    report_idx = find_report_column(rows[0])
+    if report_idx is not None:            # rows copied from Excel with their header row
+        return rows_to_entries(rows[0], rows[1:], report_idx, notes), notes
+    queries = list(dict.fromkeys(report_tokens(text)))
+    return [{"query": q, "extras": {}} for q in queries], notes
+
+
+# -----------------------------------------------------------------------------
+# Table and Excel file
+# -----------------------------------------------------------------------------
+def number_text(value: Any) -> str:
+    number = float(value)
+    if number != number or number in (float("inf"), float("-inf")):
+        return ""
+    return str(int(number)) if number.is_integer() else repr(number)
+
+
+def cell_text(value: Any) -> str:
+    """A cell as it is shown: 1.00 -> '1', 8.50 -> '8.5', blanks -> ''."""
+    if is_blank(value):
+        return ""
+    if isinstance(value, numbers.Number) and not isinstance(value, bool):
+        return number_text(value)
+    return re.sub(r"[\t\r\n]+", " ", str(value)).strip()
+
+
+def as_number(value: Any) -> Optional[float]:
+    try:
+        return float(str(value).replace(",", "").strip())
+    except ValueError:
+        return None
+
+
+def to_cell_value(column: str, value: Any) -> Any:
+    """A value you pasted (Lot no, P/ct …): numbers become numbers, anything else stays as typed."""
+    text = clean_text(value)
+    if column in NUMBER_COLUMNS and as_number(text) is not None:
+        return as_number(text)
+    return text or None
+
+
+def igi_row(query: str, result: Optional[Dict[str, Any]], igi_number: bool,
+            date_fmt: str) -> Optional[Dict[str, Any]]:
+    """The row from IGI's record, or None when the report has No Data."""
+    if not has_data(result):
+        return None
+    try:
+        return build_row(query, result["record"], igi_number, date_fmt)
+    except Exception:                         # a record that cannot be read is No Data as well
+        log_problem(f"{query} -> {NO_DATA}: IGI's record could not be read", error=True)
+        return None
+
+
+def build_table(entries: List[Dict[str, Any]], results: Dict[str, Dict[str, Any]],
+                igi_number: bool, date_fmt: str, skip_missing: bool) -> Tuple[pd.DataFrame, List[str]]:
+    """The 28-column table as text, as it is shown (blank cells stay blank), and the reports with No Data.
+
+    A report IGI did not return (not found, blocked or any other error) keeps its row with your
+    pasted values, and NO_DATA_COLUMN says No Data; SKIP_MISSING leaves such rows out.
+    """
+    rows = []
+    no_data: Dict[str, None] = {}             # report numbers with No Data, in order
+    for entry in entries:
+        query = entry["query"]
+        row = igi_row(query, results.get(query), igi_number, date_fmt)
+        if row is None:
+            no_data[query] = None
+            if skip_missing:
+                continue
+            row = build_row(query, {}, igi_number, date_fmt)
+            row[NO_DATA_COLUMN] = NO_DATA
+        for column, value in (entry.get("extras") or {}).items():
+            if is_blank(row.get(column)):         # IGI's value wins; your pasted value fills the rest
+                row[column] = to_cell_value(column, value)
+        rows.append({column: cell_text(row[column]) for column in OUTPUT_COLUMNS})
+    return pd.DataFrame(rows, columns=OUTPUT_COLUMNS, dtype=object), list(no_data)
+
+
+def table_rows_text(df: pd.DataFrame) -> List[List[str]]:
+    return [[cell_text(row[column]) for column in OUTPUT_COLUMNS] for _, row in df.iterrows()]
+
+
+def excel_bytes(df: pd.DataFrame, date_fmt: str) -> bytes:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+
+    python_fmt, excel_fmt = DATE_FORMATS.get(date_fmt, (None, None))
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "IGI"
+    ws.append(OUTPUT_COLUMNS)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+
+    for _, row in df.iterrows():
+        values = []
+        for column in OUTPUT_COLUMNS:
+            value = row[column]
+            if is_blank(value):
+                values.append(None)
+            elif column in NUMBER_COLUMNS:
+                number = as_number(value)
+                values.append(number if number is not None else str(value))
+            elif column == "Report No." and str(value).isdigit() and not str(value).startswith("0"):
+                values.append(int(value))
+            elif column == "Report Date" and python_fmt:
+                try:
+                    values.append(datetime.strptime(str(value), python_fmt))
+                except ValueError:
+                    values.append(str(value))
+            else:
+                values.append(str(value))
+        ws.append(values)
+
+    date_col = OUTPUT_COLUMNS.index("Report Date") + 1
+    for r in range(2, ws.max_row + 1):
+        cell = ws.cell(row=r, column=date_col)
+        if isinstance(cell.value, datetime) and excel_fmt:
+            cell.number_format = excel_fmt
+
+    texts = table_rows_text(df)
+    for i, column in enumerate(OUTPUT_COLUMNS):
+        longest = max([len(column)] + [len(r[i]) for r in texts])
+        ws.column_dimensions[get_column_letter(i + 1)].width = min(max(longest + 2, 6), 45)
+    ws.freeze_panes = "A2"
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
+# -----------------------------------------------------------------------------
+# Streamlit page
+# -----------------------------------------------------------------------------
+@contextmanager
+def no_data_on_error(where: str) -> Iterator[None]:
+    """Any error inside shows only No Data on the page; the details go to the console or the app's logs."""
+    try:
+        yield
+    except Exception:
+        log_problem(f"error in {where}", error=True)
+        st.warning(NO_DATA)
+
+
+@st.cache_resource
+def fetch_lock() -> threading.Lock:
+    """One IGI batch at a time on this server: one browser at a time keeps the app's memory low."""
+    return threading.Lock()
+
+
+def run_fetch(entries: List[Dict[str, Any]], method: str, show_chrome: bool) -> None:
+    state = st.session_state
+    results: Dict[str, Dict[str, Any]] = state["results"]
+    state["entries"] = entries
+    todo = [q for q in dict.fromkeys(e["query"] for e in entries) if not has_data(results.get(q))]
+    if not todo:
+        st.info("These reports were read already. To read them again, click 'Clear all' in the sidebar "
+                "and paste the numbers again.")
+        return
+
+    lock = fetch_lock()
+    if not lock.acquire(blocking=False):
+        waiting = st.info("Someone else is reading from IGI on this app; your list starts when theirs is done…")
+        lock.acquire()
+        waiting.empty()
+    fetcher = None
+    try:
+        bar = st.progress(0.0, text="Starting…")
+        note = st.empty()
+        fetcher = IGIFetcher(method, show_chrome, on_status=lambda message: note.info(message))
+        for i, query in enumerate(todo):
+            bar.progress(i / len(todo), text=f"Reading {query}  ({i + 1} of {len(todo)})")
+            try:
+                result = fetcher.fetch(query)
+            except Exception as exc:          # any error: this report has No Data
+                result = FetchResult(query, "Error", message=short_error(exc))
+            if result.status != "OK":         # the page shows only No Data; the reason goes to the log
+                log_problem(f"{query} -> {NO_DATA} ({result.status}): {result.message}")
+            results[query] = asdict(result)
+            note.empty()
+        bar.progress(1.0, text=f"Done: {len(todo)} report(s) read.")
+    except Exception:                         # any other error: the reports not read yet have No Data
+        log_problem("error while reading from IGI", error=True)
+    finally:
+        if fetcher is not None:
+            fetcher.close()
+        lock.release()
+
+
+def column_config() -> Dict[str, Any]:
+    return {column: st.column_config.TextColumn(column) for column in OUTPUT_COLUMNS}
+
+
+def show_results(entries, results, igi_number, date_fmt, skip_missing) -> Optional[pd.DataFrame]:
+    """Summary and the editable 28-column table; returns the table as edited.
+
+    A report IGI did not return (not found, blocked or any other error) is shown only as No Data.
+    """
+    df, no_data = build_table(entries, results, igi_number, date_fmt, skip_missing)
+    total = len(dict.fromkeys(e["query"] for e in entries))
+
+    st.subheader("Result")
+    summary = f"{total - len(no_data)} of {total} report(s) read from IGI."
+    (st.success if not no_data else st.warning)(summary)
+    if no_data:
+        shown = ", ".join(no_data[:20]) + (f" … and {len(no_data) - 20} more" if len(no_data) > 20 else "")
+        st.write(f"**{NO_DATA}:** {shown}")
+    if df.empty:                              # SKIP_MISSING left out every row
+        return None
+
+    key = f"table_{zlib.crc32(df.to_json().encode('utf-8')):08x}"   # new table -> fresh editor
+    edited = st.data_editor(df, key=key, hide_index=True, num_rows="fixed", column_config=column_config())
+    return edited
+
+
+def result_buttons(edited: pd.DataFrame, date_fmt: str) -> None:
+    """The Download Excel button (shown in the sidebar)."""
+    today = datetime.now().strftime("%d-%m-%Y")
+    xlsx = excel_bytes(edited, date_fmt)
+    st.download_button(
+        "Download Excel", xlsx, file_name=SAVE_FILE_NAME.format(date=today),
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+def bookmark_button() -> None:
+    """The red IGI → sheet button, to drag onto the bookmarks bar."""
+    page = BOOKMARK_BUTTON_HTML.replace("__URL__", html.escape(bookmarklet_url(), quote=True)).strip()
+    if hasattr(st, "iframe"):
+        st.iframe(page, height=90)
+    else:                                     # Streamlit before 1.56
+        import streamlit.components.v1 as components
+
+        components.html(page, height=90)
+
+
+def fetch_in_browser_button(label: str, numbers: List[str]) -> Tuple[Optional[str], bool]:
+    """Streamlit Cloud: the Fetch button (sidebar). It opens IGI in a new tab, where the IGI → sheet
+    bookmark reads the reports and sends them back here.
+
+    Returns (the bookmark's result if it has just come back, whether the button has just been clicked).
+    """
+    url = browser_link(numbers) if numbers else ""
+    try:
+        from streamlit.components import v2 as components_v2
+    except ImportError:                       # Streamlit before components v2
+        components_v2 = None
+    if components_v2 is not None:
+        try:
+            bridge = components_v2.component("igi_sheet_bridge", html=BRIDGE_HTML, css=BRIDGE_CSS, js=BRIDGE_JS)
+            result = bridge(key="igi_sheet_bridge", data={"url": url, "label": label, "numbers": numbers},
+                            on_reports_change=lambda: None, on_opened_change=lambda: None)
+            return getattr(result, "reports", None), bool(getattr(result, "opened", None))
+        except Exception:
+            log_problem("the Fetch button could not be shown; using a plain link", error=True)
+    if url:                                   # a plain link: the result is pasted by hand
+        st.link_button(label, url, type="primary")
+    else:
+        st.button(label, type="primary", disabled=True)
+    return None, False
+
+
+def take_browser_result(text: str, entries: List[Dict[str, Any]]) -> Tuple[int, str]:
+    """Puts the bookmark's result into the table. Returns (reports taken, problem message or "")."""
+    state = st.session_state
+    results, problem = parse_browser_result(text)
+    if results:
+        state["results"].update(results)
+        known = {e["query"] for e in entries}
+        state["entries"] = entries + [{"query": q, "extras": {}} for q in results if q not in known]
+    return len(results), problem
+
+
+def take_pasted_result() -> None:
+    """The result pasted by hand in the sidebar: read once, then the box is emptied."""
+    state = st.session_state
+    text = state.get("browser_result", "")
+    state["paste_problem"] = ""
+    if not text.strip():
+        return
+    entries, _ = parse_pasted(state.get("numbers", ""))
+    count, problem = take_browser_result(text, entries)
+    if count:
+        state["browser_result"] = ""
+        state["browser_done"] = count
+    else:
+        state["paste_problem"] = problem
+
+
+def browser_help() -> None:
+    """Streamlit Cloud, in the sidebar: adding the bookmark once, and pasting a result by hand."""
+    with st.expander("First time: add the IGI → sheet bookmark"):
+        bookmark_button()
+        st.caption("Drag the red button onto your bookmarks bar (Ctrl+Shift+B shows the bar), "
+                   "or add a bookmark by hand with this address:")
+        st.code(bookmarklet_url(), language=None)
+        st.caption("Added the bookmark before this version? Add it again and delete the old one.")
+    with st.expander("Result not back? Paste it here"):
+        st.text_area(
+            "Result from the IGI tab", key="browser_result", height=68, on_change=take_pasted_result,
+            placeholder='On the IGI tab click "Copy result", paste here, then press Ctrl+Enter',
+            label_visibility="collapsed",
+        )
+        if st.session_state.get("paste_problem"):
+            st.warning(st.session_state["paste_problem"])
+
+
+def clear_all() -> None:
+    """Start over: the report numbers, the result table and any pasted browser result."""
+    state = st.session_state
+    state["numbers"] = ""
+    state["results"] = {}
+    state["entries"] = []
+    state["browser_result"] = ""
+    state["paste_problem"] = ""
+    state.pop("browser_done", None)
+
+
+def main() -> None:
+    st.set_page_config(page_title="IGI Report Data", page_icon="💎", layout="wide")
+    state = st.session_state
+    state.setdefault("results", {})
+    state.setdefault("entries", [])
+    state.setdefault("numbers", "")
+    state.setdefault("browser_result", "")
+    state.setdefault("paste_problem", "")
+    show_chrome = SHOW_CHROME and BROWSER_KIND == "uc"     # the server's Chromium is always hidden
+
+    # The same page on your PC and on Streamlit Cloud: the report numbers, then the result. The buttons
+    # are in the sidebar; no settings are shown. On your PC the Fetch button reads IGI here; on
+    # Streamlit Cloud (whose servers IGI blocks) it opens IGI in your browser, where the bookmark reads it.
+    st.title("IGI Report Data")
+    pasted = st.text_area(
+        "Report numbers", key="numbers", height=170,
+        placeholder="Paste here…",
+    )
+    entries, notes = parse_pasted(pasted)
+    for note in notes:
+        st.warning(note)
+
+    fetch, received, opened = False, None, False
+    with st.sidebar:
+        unique = list(dict.fromkeys(e["query"] for e in entries))
+        label = f"Fetch {len(unique)} report(s) from IGI" if entries else "Fetch from IGI"
+        if READ_ON_SERVER:                  # your PC: the app reads IGI itself
+            fetch = st.button(label, type="primary", disabled=not entries)
+        else:                               # Streamlit Cloud: your own browser reads IGI
+            with no_data_on_error("the Fetch button"):
+                todo = [q for q in unique if not has_data(state["results"].get(q))]
+                received, opened = fetch_in_browser_button(label, todo or unique)
+                st.caption("Opens IGI in a new tab: there, click your **IGI → sheet** bookmark.")
+        st.button("Clear all", on_click=clear_all, help="Clears the report numbers and the result.")
+        if not READ_ON_SERVER:
+            with no_data_on_error("the bookmark help"):
+                browser_help()
+
+    if READ_ON_SERVER:
+        if fetch:
+            run_fetch(entries, READ_METHOD, show_chrome)
+    else:
+        with no_data_on_error("the result sent back by the IGI tab"):
+            if received:                    # the IGI tab sent the bookmark's result back
+                count, problem = take_browser_result(received, entries)
+                if count:
+                    state["browser_done"] = count
+                else:
+                    log_problem(f"result sent back by the IGI tab not read: {problem}")
+                    st.warning(NO_DATA)
+            done = state.pop("browser_done", 0)
+            if done:
+                st.progress(1.0, text=f"Done: {done} report(s) read.")
+            elif opened:
+                st.info("IGI is open in a new tab: click your **IGI → sheet** bookmark there. "
+                        "The reports come back here by themselves.")
+
+    edited = None
+    if state["entries"]:
+        with no_data_on_error("the result table"):
+            edited = show_results(state["entries"], state["results"], REPORT_NO_AS_IGI, DATE_FORMAT, SKIP_MISSING)
+    if edited is not None:
+        with st.sidebar:
+            st.divider()
+            st.subheader("File:")
+            with no_data_on_error("the Excel file"):
+                result_buttons(edited, DATE_FORMAT)
+
+
+def _inside_streamlit() -> bool:
+    try:
+        from streamlit import runtime
+        return runtime.exists()
+    except Exception:
+        return False
+
+
+if __name__ == "__main__":
+    if _inside_streamlit():
+        with no_data_on_error("the page"):  # an error not caught above shows No Data, not Streamlit's error box
+            main()
+    else:                                   # "python streamlit_app.py": start Streamlit
+        from streamlit.web import cli as stcli
+
+        sys.argv = ["streamlit", "run", os.path.abspath(__file__)]
+        sys.exit(stcli.main())

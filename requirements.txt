@@ -1,0 +1,8 @@
+streamlit>=1.67,<2
+pandas
+openpyxl
+requests
+# Only on a Windows PC, where the app reads IGI itself in a visible Chrome. Streamlit Cloud skips these lines.
+selenium>=4.10; sys_platform == "win32"
+undetected-chromedriver; sys_platform == "win32"
+setuptools; sys_platform == "win32"
